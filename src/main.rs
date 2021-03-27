@@ -1,16 +1,22 @@
-use tracing_subscriber::fmt::format::FmtSpan;
+use std::error::Error;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Registry;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
     let state = models::init_state();
     let api = filters::users(state);
 
-    tracing_subscriber::fmt()
-        .with_env_filter("tracing=info,warp=debug")
-        .with_span_events(FmtSpan::CLOSE)
-        .init();
+    let (tracer, _uninstall) = opentelemetry_jaeger::new_pipeline()
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .install()?;
+    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+    let subscriber = Registry::default().with(telemetry);
+    tracing::subscriber::set_global_default(subscriber)?;
 
     warp::serve(api).run(([127, 0, 0, 1], 3030)).await;
+
+    Ok(())
 }
 
 mod filters {
