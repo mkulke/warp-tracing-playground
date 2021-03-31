@@ -711,6 +711,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5986aa8d62380092d2f50f8b1cdba9cb9b6731ffd4b25b51fd126b6c3e05b99c"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "protobuf",
+ "thiserror",
+]
+
+[[package]]
+name = "protobuf"
+version = "2.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b7f4a129bb3754c25a4e04032a90173c68f85168f77118ac4cb4936e7f06f92"
+
+[[package]]
 name = "quick-error"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1374,8 +1395,10 @@ dependencies = [
 name = "warp-tracing-playground"
 version = "0.1.0"
 dependencies = [
+ "lazy_static",
  "opentelemetry",
  "opentelemetry-jaeger",
+ "prometheus",
  "serde",
  "tokio",
  "tracing",

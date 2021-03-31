@@ -22,15 +22,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod filters {
     use super::handlers;
     use super::models::{State, User};
+    use lazy_static::lazy_static;
+    use prometheus::{
+        register_histogram_vec, register_int_counter, register_int_counter_vec, HistogramOpts,
+        HistogramVec, IntCounter, IntCounterVec, Opts,
+    };
     use std::convert::Infallible;
     use warp::Filter;
+
+    lazy_static! {
+        pub static ref INCOMING_REQUESTS: IntCounter =
+            register_int_counter!("incoming_requests", "Incoming Requests").unwrap();
+        pub static ref STATUS_CODES: IntCounterVec = register_int_counter_vec!(
+            Opts::new("status_code", "Status Codes"),
+            &["method", "path", "type"]
+        )
+        .unwrap();
+        pub static ref RESPONSE_TIMES: HistogramVec = register_histogram_vec!(
+            HistogramOpts::new("response_time", "Response Times"),
+            &["status_code", "method", "path"]
+        )
+        .unwrap();
+    }
+
+    fn record_metrics(info: warp::log::Info) {
+        INCOMING_REQUESTS.inc();
+        RESPONSE_TIMES
+            .with_label_values(&[info.status().as_str(), info.method().as_str(), info.path()])
+            .observe(info.elapsed().as_millis() as f64);
+        let status_family = match info.status().as_u16() {
+            500..=599 => "500",
+            400..=499 => "400",
+            300..=399 => "300",
+            200..=299 => "200",
+            100..=199 => "100",
+            _ => "unknown",
+        };
+        STATUS_CODES
+            .with_label_values(&[info.method().as_str(), info.path(), status_family])
+            .inc();
+    }
 
     pub fn users(
         state: State,
     ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
         list_users(state.clone())
             .or(create_user(state.clone()))
+            .or(metrics())
             .with(warp::trace::request())
+            .with(warp::log::custom(record_metrics))
     }
 
     pub fn list_users(
@@ -52,6 +92,12 @@ mod filters {
             .and_then(handlers::create_user)
     }
 
+    pub fn metrics() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+        warp::path!("metrics")
+            .and(warp::get())
+            .and_then(handlers::metrics)
+    }
+
     fn with_state(state: State) -> impl Filter<Extract = (State,), Error = Infallible> + Clone {
         warp::any().map(move || state.clone())
     }
@@ -63,6 +109,7 @@ mod filters {
 
 mod handlers {
     use super::models::{State, User};
+    use prometheus::Encoder;
     use std::convert::Infallible;
     use tracing::instrument;
     use warp::http::StatusCode;
@@ -78,6 +125,15 @@ mod handlers {
         let mut users = state.lock().await;
         users.push(user);
         Ok(StatusCode::CREATED)
+    }
+
+    pub async fn metrics() -> Result<impl warp::Reply, Infallible> {
+        let encoder = prometheus::TextEncoder::new();
+        let registry = prometheus::default_registry();
+        let mut buffer = Vec::new();
+        encoder.encode(&registry.gather(), &mut buffer).unwrap();
+        let text = String::from_utf8(buffer).unwrap();
+        Ok(text)
     }
 }
 
