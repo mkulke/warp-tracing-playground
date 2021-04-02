@@ -1,22 +1,35 @@
 use std::error::Error;
+use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::Registry;
+use tracing_subscriber::{EnvFilter, Registry};
+
+fn init_tracing() -> Result<(), Box<dyn Error>> {
+    let formatting_layer =
+        BunyanFormattingLayer::new(env!("CARGO_PKG_NAME").into(), std::io::stdout);
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let tracer = opentelemetry_jaeger::new_pipeline()
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .install_batch(opentelemetry::runtime::Tokio)?;
+    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    let subscriber = Registry::default()
+        .with(telemetry)
+        .with(env_filter)
+        .with(JsonStorageLayer)
+        .with(formatting_layer);
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    Ok(())
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() {
     let state = models::init_state();
     let api = filters::users(state);
 
-    let (tracer, _uninstall) = opentelemetry_jaeger::new_pipeline()
-        .with_service_name(env!("CARGO_PKG_NAME"))
-        .install()?;
-    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-    let subscriber = Registry::default().with(telemetry);
-    tracing::subscriber::set_global_default(subscriber)?;
+    init_tracing().expect("failed to init tracing");
 
     warp::serve(api).run(([127, 0, 0, 1], 3030)).await;
-
-    Ok(())
 }
 
 mod filters {
@@ -28,24 +41,25 @@ mod filters {
         HistogramVec, IntCounter, IntCounterVec, Opts,
     };
     use std::convert::Infallible;
+    use warp::log::Info;
     use warp::Filter;
 
     lazy_static! {
-        pub static ref INCOMING_REQUESTS: IntCounter =
+        static ref INCOMING_REQUESTS: IntCounter =
             register_int_counter!("incoming_requests", "Incoming Requests").unwrap();
-        pub static ref STATUS_CODES: IntCounterVec = register_int_counter_vec!(
+        static ref STATUS_CODES: IntCounterVec = register_int_counter_vec!(
             Opts::new("status_code", "Status Codes"),
             &["method", "path", "type"]
         )
         .unwrap();
-        pub static ref RESPONSE_TIMES: HistogramVec = register_histogram_vec!(
+        static ref RESPONSE_TIMES: HistogramVec = register_histogram_vec!(
             HistogramOpts::new("response_time", "Response Times"),
             &["status_code", "method", "path"]
         )
         .unwrap();
     }
 
-    fn record_metrics(info: warp::log::Info) {
+    fn record_metrics(info: Info) {
         INCOMING_REQUESTS.inc();
         RESPONSE_TIMES
             .with_label_values(&[info.status().as_str(), info.method().as_str(), info.path()])
@@ -67,7 +81,7 @@ mod filters {
         state: State,
     ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
         list_users(state.clone())
-            .or(create_user(state.clone()))
+            .or(create_user(state))
             .or(metrics())
             .with(warp::trace::request())
             .with(warp::log::custom(record_metrics))
