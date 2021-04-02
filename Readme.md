@@ -30,7 +30,9 @@ cat << EOF | http POST localhost:3030/users
 EOF
 ```
 
-`http localhost:3030/users`
+```
+http localhost:3030/users
+```
 
 ## Check Metrics
 
