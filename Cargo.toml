@@ -12,9 +12,12 @@ warp = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.2"
-opentelemetry = { version = "0.13", features = ["rt-tokio", "trace"] }
+opentelemetry = { version = "0.13", features = ["rt-tokio", "trace", "metrics"] }
 opentelemetry-jaeger = { version = "0.12", features = ["tokio"] }
+opentelemetry-prometheus = "0.6"
 tracing-opentelemetry = "0.12"
 tracing-bunyan-formatter = "0.2.0"
-lazy_static = "1.4"
 prometheus = "0.12"
+
+[profile.dev]
+split-debuginfo = "unpacked"

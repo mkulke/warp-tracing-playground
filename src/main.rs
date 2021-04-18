@@ -1,88 +1,44 @@
 use std::error::Error;
-use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
+use tracing_bunyan_formatter as bunyan;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::{EnvFilter, Registry};
-
-fn init_tracing() -> Result<(), Box<dyn Error>> {
-    let formatting_layer =
-        BunyanFormattingLayer::new(env!("CARGO_PKG_NAME").into(), std::io::stdout);
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let tracer = opentelemetry_jaeger::new_pipeline()
-        .with_service_name(env!("CARGO_PKG_NAME"))
-        .install_batch(opentelemetry::runtime::Tokio)?;
-    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-
-    let subscriber = Registry::default()
-        .with(telemetry)
-        .with(env_filter)
-        .with(JsonStorageLayer)
-        .with(formatting_layer);
-    tracing::subscriber::set_global_default(subscriber)?;
-
-    Ok(())
-}
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
+    let tracer = observability::init_tracer()?;
+    tracing_subscriber::Registry::default()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(bunyan::JsonStorageLayer)
+        .with(bunyan::BunyanFormattingLayer::new(
+            env!("CARGO_PKG_NAME").into(),
+            std::io::stdout,
+        ))
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .init();
+    let metrics_exporter = observability::init_metrics_exporter()?;
+
     let state = models::init_state();
-    let api = filters::users(state);
-
-    init_tracing().expect("failed to init tracing");
-
+    let api = filters::users(state, metrics_exporter);
     warp::serve(api).run(([127, 0, 0, 1], 3030)).await;
+
+    Ok(())
 }
 
 mod filters {
     use super::handlers;
     use super::models::{State, User};
-    use lazy_static::lazy_static;
-    use prometheus::{
-        register_histogram_vec, register_int_counter, register_int_counter_vec, HistogramOpts,
-        HistogramVec, IntCounter, IntCounterVec, Opts,
-    };
+    use super::observability::{MetricsExporter, record_metrics};
     use std::convert::Infallible;
-    use warp::log::Info;
     use warp::Filter;
-
-    lazy_static! {
-        static ref INCOMING_REQUESTS: IntCounter =
-            register_int_counter!("incoming_requests", "Incoming Requests").unwrap();
-        static ref STATUS_CODES: IntCounterVec = register_int_counter_vec!(
-            Opts::new("status_code", "Status Codes"),
-            &["method", "path", "type"]
-        )
-        .unwrap();
-        static ref RESPONSE_TIMES: HistogramVec = register_histogram_vec!(
-            HistogramOpts::new("response_time", "Response Times"),
-            &["status_code", "method", "path"]
-        )
-        .unwrap();
-    }
-
-    fn record_metrics(info: Info) {
-        INCOMING_REQUESTS.inc();
-        RESPONSE_TIMES
-            .with_label_values(&[info.status().as_str(), info.method().as_str(), info.path()])
-            .observe(info.elapsed().as_millis() as f64);
-        let status_family = match info.status().as_u16() {
-            500..=599 => "500",
-            400..=499 => "400",
-            300..=399 => "300",
-            200..=299 => "200",
-            100..=199 => "100",
-            _ => "unknown",
-        };
-        STATUS_CODES
-            .with_label_values(&[info.method().as_str(), info.path(), status_family])
-            .inc();
-    }
 
     pub fn users(
         state: State,
+        metrics_exporter: impl MetricsExporter,
     ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
         list_users(state.clone())
             .or(create_user(state))
-            .or(metrics())
+            .or(metrics(metrics_exporter))
             .with(warp::trace::request())
             .with(warp::log::custom(record_metrics))
     }
@@ -106,14 +62,23 @@ mod filters {
             .and_then(handlers::create_user)
     }
 
-    pub fn metrics() -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    pub fn metrics(
+        exporter: impl MetricsExporter,
+    ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
         warp::path!("metrics")
             .and(warp::get())
+            .and(with_exporter(exporter))
             .and_then(handlers::metrics)
     }
 
     fn with_state(state: State) -> impl Filter<Extract = (State,), Error = Infallible> + Clone {
         warp::any().map(move || state.clone())
+    }
+
+    fn with_exporter(
+        exporter: impl MetricsExporter,
+    ) -> impl Filter<Extract = (impl MetricsExporter,), Error = Infallible> + Clone {
+        warp::any().map(move || exporter.clone())
     }
 
     fn json_body() -> impl Filter<Extract = (User,), Error = warp::Rejection> + Clone {
@@ -123,7 +88,7 @@ mod filters {
 
 mod handlers {
     use super::models::{State, User};
-    use prometheus::Encoder;
+    use super::observability::MetricsExporter;
     use std::convert::Infallible;
     use tracing::instrument;
     use warp::http::StatusCode;
@@ -141,13 +106,9 @@ mod handlers {
         Ok(StatusCode::CREATED)
     }
 
-    pub async fn metrics() -> Result<impl warp::Reply, Infallible> {
-        let encoder = prometheus::TextEncoder::new();
-        let registry = prometheus::default_registry();
-        let mut buffer = Vec::new();
-        encoder.encode(&registry.gather(), &mut buffer).unwrap();
-        let text = String::from_utf8(buffer).unwrap();
-        Ok(text)
+    pub async fn metrics(exporter: impl MetricsExporter) -> Result<impl warp::Reply, Infallible> {
+        let buf = exporter.export();
+        Ok(buf)
     }
 }
 
@@ -178,5 +139,168 @@ mod models {
         pub first_name: Option<String>,
         pub last_name: String,
         pub gender: Gender,
+    }
+}
+
+mod observability {
+    use opentelemetry::metrics::MetricsError;
+    use opentelemetry::sdk;
+    use opentelemetry::trace::TraceError;
+    use opentelemetry::KeyValue;
+    use opentelemetry_prometheus::PrometheusExporter;
+    use prometheus::Encoder;
+    use std::convert::{TryInto, TryFrom};
+    use warp::log::Info;
+    use opentelemetry::{global, Unit};
+
+    pub fn init_metrics_exporter() -> Result<PrometheusExporter, MetricsError> {
+        opentelemetry_prometheus::exporter()
+            .with_default_histogram_boundaries(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1., 2.5, 5., 10.,
+            ])
+            .try_init()
+    }
+
+    pub fn init_tracer() -> Result<sdk::trace::Tracer, TraceError> {
+        opentelemetry_jaeger::new_pipeline()
+            .with_service_name(env!("CARGO_PKG_NAME"))
+            .install_batch(opentelemetry::runtime::Tokio)
+    }
+
+    pub struct ServiceMetrics {
+        pub duration_ms: u64,
+        pub status_family: &'static str,
+        pub method: &'static str,
+        pub path: &'static str,
+    }
+
+    impl ServiceMetrics {
+        pub fn duration_labels(&self) -> Vec<KeyValue> {
+            [
+                KeyValue::new("http.status_code", self.status_family),
+                KeyValue::new("http.method", self.method),
+                KeyValue::new("http.target", self.path),
+            ]
+            .into()
+        }
+
+        pub fn status_code_labels(&self) -> Vec<KeyValue> {
+            [
+                KeyValue::new("http.status_code", self.status_family),
+                KeyValue::new("http.method", self.method),
+            ]
+            .into()
+        }
+    }
+
+    impl TryFrom<&Info<'_>> for ServiceMetrics {
+        type Error = &'static str;
+
+        fn try_from(info: &Info) -> Result<Self, Self::Error> {
+            let duration_ms = info.elapsed().as_millis() as u64;
+            let status_family = match info.status().as_u16() {
+                500..=599 => Ok("500"),
+                400..=499 => Ok("400"),
+                300..=399 => Ok("300"),
+                200..=299 => Ok("200"),
+                100..=199 => Ok("100"),
+                _ => Err("unknown status code"),
+            }?;
+            let method = match info.method().as_str() {
+                "GET" => Ok("GET"),
+                "POST" => Ok("POST"),
+                _ => Err("unknown http method"),
+            }?;
+            let path = match info.path() {
+                "/users" => "/users",
+                _ => "invalid",
+            };
+            let metrics = Self {
+                duration_ms,
+                status_family,
+                method,
+                path,
+            };
+
+            Ok(metrics)
+        }
+    }
+
+    pub trait MetricsExporter: Clone + Send {
+        fn export(&self) -> Vec<u8>;
+    }
+
+    impl MetricsExporter for PrometheusExporter {
+        fn export(&self) -> Vec<u8> {
+            let encoder = prometheus::TextEncoder::new();
+            let metric_families = self.registry().gather();
+            let mut buf = Vec::new();
+            encoder.encode(&metric_families, &mut buf).unwrap();
+            buf
+        }
+    }
+
+    pub fn record_metrics(info: Info) {
+        let meter = global::meter("web-service");
+        let incoming_requests = meter.u64_counter("incoming_requests").init();
+        let duration = meter
+            .u64_value_recorder("http.server.duration")
+            .with_unit(Unit::new("milliseconds"))
+            .init();
+        let status_codes = meter.u64_counter("status_codes").init();
+
+        if info.path() == "/metrics" {
+            return;
+        }
+
+        let result: Result<ServiceMetrics, _> = (&info).try_into();
+        if let Ok(metrics) = result {
+            incoming_requests.add(1, &[]);
+            duration.record(metrics.duration_ms, &metrics.duration_labels());
+            status_codes.add(1, &metrics.status_code_labels());
+        };
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filters;
+    use super::models::init_state;
+    use super::observability::init_metrics_exporter;
+    use warp::http::StatusCode;
+    use warp::test::request;
+
+    #[tokio::test]
+    async fn get_users() {
+        let api = filters::users(init_state(), init_metrics_exporter().unwrap());
+
+        let response = request().method("GET").path("/users").reply(&api).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn create_user() {
+        let state = init_state();
+        let api = filters::users(state.clone(), init_metrics_exporter().unwrap());
+
+        let response = request()
+            .method("POST")
+            .path("/users")
+            .body(
+                r#"{
+                "firstName": "Jane",
+                "lastName": "Doe",
+                "gender": "female",
+                "id": 123
+            }"#,
+            )
+            .reply(&api)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let users = state.lock().await;
+        assert_eq!(users[0].id, 123);
     }
 }
