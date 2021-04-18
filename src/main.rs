@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod filters {
     use super::handlers;
     use super::models::{State, User};
-    use super::observability::{MetricsExporter, record_metrics};
+    use super::observability::{record_metrics, MetricsExporter};
     use std::convert::Infallible;
     use warp::Filter;
 
@@ -147,11 +147,11 @@ mod observability {
     use opentelemetry::sdk;
     use opentelemetry::trace::TraceError;
     use opentelemetry::KeyValue;
+    use opentelemetry::{global, Unit};
     use opentelemetry_prometheus::PrometheusExporter;
     use prometheus::Encoder;
-    use std::convert::{TryInto, TryFrom};
+    use std::convert::{TryFrom, TryInto};
     use warp::log::Info;
-    use opentelemetry::{global, Unit};
 
     pub fn init_metrics_exporter() -> Result<PrometheusExporter, MetricsError> {
         opentelemetry_prometheus::exporter()
@@ -260,7 +260,6 @@ mod observability {
             status_codes.add(1, &metrics.status_code_labels());
         };
     }
-
 }
 
 #[cfg(test)]
