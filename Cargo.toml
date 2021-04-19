@@ -18,6 +18,7 @@ opentelemetry-prometheus = "0.6"
 tracing-opentelemetry = "0.12"
 tracing-bunyan-formatter = "0.2.0"
 prometheus = "0.12"
+lazy_static = "1.4"
 
 [profile.dev]
 split-debuginfo = "unpacked"
