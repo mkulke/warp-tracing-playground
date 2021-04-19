@@ -143,7 +143,9 @@ mod models {
 }
 
 mod observability {
+    use lazy_static::lazy_static;
     use opentelemetry::metrics::MetricsError;
+    use opentelemetry::metrics::{Counter, ValueRecorder};
     use opentelemetry::sdk;
     use opentelemetry::trace::TraceError;
     use opentelemetry::KeyValue;
@@ -152,6 +154,29 @@ mod observability {
     use prometheus::Encoder;
     use std::convert::{TryFrom, TryInto};
     use warp::log::Info;
+
+    struct Meters {
+        pub incoming_requests: Counter<u64>,
+        pub duration: ValueRecorder<u64>,
+        pub status_codes: Counter<u64>,
+    }
+
+    lazy_static! {
+        static ref METERS: Meters = {
+            let meter = global::meter("web-service");
+            let incoming_requests = meter.u64_counter("incoming_requests").init();
+            let duration = meter
+                .u64_value_recorder("http.server.duration")
+                .with_unit(Unit::new("milliseconds"))
+                .init();
+            let status_codes = meter.u64_counter("status_codes").init();
+            Meters {
+                incoming_requests,
+                duration,
+                status_codes,
+            }
+        };
+    }
 
     pub fn init_metrics_exporter() -> Result<PrometheusExporter, MetricsError> {
         opentelemetry_prometheus::exporter()
@@ -190,6 +215,16 @@ mod observability {
                 KeyValue::new("http.method", self.method),
             ]
             .into()
+        }
+    }
+
+    impl ServiceMetrics {
+        fn record(&self) {
+            METERS.incoming_requests.add(1, &[]);
+            METERS
+                .duration
+                .record(self.duration_ms, &self.duration_labels());
+            METERS.status_codes.add(1, &self.status_code_labels());
         }
     }
 
@@ -241,23 +276,13 @@ mod observability {
     }
 
     pub fn record_metrics(info: Info) {
-        let meter = global::meter("web-service");
-        let incoming_requests = meter.u64_counter("incoming_requests").init();
-        let duration = meter
-            .u64_value_recorder("http.server.duration")
-            .with_unit(Unit::new("milliseconds"))
-            .init();
-        let status_codes = meter.u64_counter("status_codes").init();
-
         if info.path() == "/metrics" {
             return;
         }
 
         let result: Result<ServiceMetrics, _> = (&info).try_into();
         if let Ok(metrics) = result {
-            incoming_requests.add(1, &[]);
-            duration.record(metrics.duration_ms, &metrics.duration_labels());
-            status_codes.add(1, &metrics.status_code_labels());
+            metrics.record();
         };
     }
 }
@@ -289,11 +314,11 @@ mod tests {
             .path("/users")
             .body(
                 r#"{
-                "firstName": "Jane",
-                "lastName": "Doe",
-                "gender": "female",
-                "id": 123
-            }"#,
+                    "firstName": "Jane",
+                    "lastName": "Doe",
+                    "gender": "female",
+                    "id": 123
+                }"#,
             )
             .reply(&api)
             .await;
