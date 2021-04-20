@@ -200,7 +200,7 @@ mod observability {
     }
 
     impl ServiceMetrics {
-        pub fn duration_labels(&self) -> Vec<KeyValue> {
+        fn duration_labels(&self) -> Vec<KeyValue> {
             [
                 KeyValue::new("http.status_code", self.status_family),
                 KeyValue::new("http.method", self.method),
@@ -209,16 +209,14 @@ mod observability {
             .into()
         }
 
-        pub fn status_code_labels(&self) -> Vec<KeyValue> {
+        fn status_code_labels(&self) -> Vec<KeyValue> {
             [
                 KeyValue::new("http.status_code", self.status_family),
                 KeyValue::new("http.method", self.method),
             ]
             .into()
         }
-    }
 
-    impl ServiceMetrics {
         fn record(&self) {
             METERS.incoming_requests.add(1, &[]);
             METERS
@@ -326,5 +324,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         let users = state.lock().await;
         assert_eq!(users[0].id, 123);
+    }
+
+    #[tokio::test]
+    async fn wrong_body() {
+        let state = init_state();
+        let api = filters::users(state.clone(), init_metrics_exporter().unwrap());
+
+        let response = request()
+            .method("POST")
+            .path("/users")
+            .body(
+                r#"{
+                    "invalid": 123
+                }"#,
+            )
+            .reply(&api)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
